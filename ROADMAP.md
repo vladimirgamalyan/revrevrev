@@ -7,18 +7,22 @@ because if the host will not wake, every line of it is wasted.
 
 ## 1. Prove the host wakes at all — no code
 
-Plug an ordinary USB keyboard into the port the device will occupy, sleep the
-machine, press a key.
+**Done, 2026-07-16.** A plain USB keyboard wakes the target host from sleep, in
+any port, with nothing changed in BIOS or Device Manager — the settings were
+already permissive by default. No port restriction to design around, so the
+device can live wherever it is convenient.
 
-If it does not wake, the settings to work through are `Wake on USB` / `USB Power
-in S3/S4` in BIOS/UEFI, `ErP` or `Deep Sleep` (must be off), and the per-device
-*Allow this device to wake the computer* checkbox in Windows Device Manager.
+The procedure is kept below, because other hosts will not necessarily be this
+accommodating: plug an ordinary USB keyboard into the port the device will
+occupy, sleep the machine, press a key. If it does not wake, the settings to
+work through are `Wake on USB` / `USB Power in S3/S4` in BIOS/UEFI, `ErP` or
+`Deep Sleep` (must be off), and the per-device *Allow this device to wake the
+computer* checkbox in Windows Device Manager.
 
-Answers three things at once: whether wake is permitted in firmware, whether the
-port keeps power in the target sleep state, and which port qualifies — on many
-desktops only a subset does.
-
-**Done when:** a known-good port is identified and the premise is confirmed.
+What this establishes: wake over USB is permitted by the host firmware, and the
+ports keep power in the sleep state used. What it does not establish is covered
+by step 2 — a keyboard and this board are not the same load, and not the same
+device asking to wake.
 
 ## 2. Firmware spike — wake over USB HID
 
@@ -65,4 +69,9 @@ for not deferring this indefinitely.
 ## Open questions
 
 - Which ESP32-S3 module.
-- Which host is the target.
+- **Does the host sleep in S3, or in Modern Standby (S0ix)?** `powercfg /a`
+  answers it. Waking from every port with no BIOS change fits either — a desktop
+  that powers all ports in S3, or a machine that never truly leaves S0 — but the
+  answer changes what step 2 faces. Under Modern Standby the ports generally
+  stay powered and the suspend-current concern largely evaporates; under S3 it is
+  live.
