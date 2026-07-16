@@ -1,3 +1,6 @@
+# Credentials, compiled into the firmware (ADR-0004). Never commit.
+secrets.h
+
 # ESP-IDF build output
 build/
 

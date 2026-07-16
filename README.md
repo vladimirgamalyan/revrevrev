@@ -50,6 +50,8 @@ Waking over USB must be permitted by the host — the device cannot force it:
   no server to run.
 - [ADR-0003](docs/adr/0003-use-esp-idf-for-firmware.md) — ESP-IDF (C), for
   direct control over TinyUSB, TLS, and NVS.
+- [ADR-0004](docs/adr/0004-compile-time-secrets-header.md) — credentials live in
+  an uncommitted header for now; runtime provisioning is the intended successor.
 
 Further decisions that shape structure or carry long-lived tradeoffs go in
 [`docs/adr/`](docs/adr/README.md).
@@ -58,8 +60,10 @@ Further decisions that shape structure or carry long-lived tradeoffs go in
 
 Treat the device as physically trusted hardware:
 
-- The WiFi credentials and the Telegram bot token are stored on the device
-  (NVS). Anyone with physical access to it can potentially read them.
+- The WiFi credentials and the Telegram bot token are compiled into the firmware
+  ([ADR-0004](docs/adr/0004-compile-time-secrets-header.md)). Anyone holding a
+  build of it, or able to dump the flash, can read them — so firmware images
+  must not be published or built in CI while this holds.
 - The bot must accept commands only from an allowlist of chat IDs. A Telegram
   bot is reachable by anyone who knows its username, so an unrestricted bot is
   an open wake button.
