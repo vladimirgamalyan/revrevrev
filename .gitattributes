@@ -1,0 +1,7 @@
+# Normalize text files to LF in the repository and in the working tree, so line
+# endings do not depend on each developer's core.autocrlf setting.
+* text=auto eol=lf
+
+# Windows batch files break unless they keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
