@@ -11,7 +11,8 @@ sleeps.
 
 ## Status
 
-Early. Design is settled; no firmware yet.
+Early. Design is settled; no firmware yet. Planned work, ordered by risk, is in
+[ROADMAP.md](ROADMAP.md).
 
 ## How it works
 
