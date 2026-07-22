@@ -63,6 +63,8 @@ Waking over USB must be permitted by the host — the device cannot force it:
   an uncommitted header for now; runtime provisioning is the intended successor.
 - [ADR-0005](docs/adr/0005-rename-to-revrevrev.md) — renamed from WakeKey to
   RevRevRev.
+- [ADR-0006](docs/adr/0006-stay-on-esp32s3-wifi.md) — stay on ESP32-S3 with
+  WiFi; the ~20 mA idle draw is not worth switching to a lower-power radio.
 
 Further decisions that shape structure or carry long-lived tradeoffs go in
 [`docs/adr/`](docs/adr/README.md).
