@@ -33,6 +33,14 @@ static const char *TAG = "telegram";
 #define TG_RX_CAPACITY 8192
 #define TG_URL_CAPACITY 512
 
+// Longest reply this firmware formats (tg_send_status). Sizes msg[] and the
+// send-side encode buffer so a fully percent-encoded reply is never truncated.
+#define TG_MSG_CAPACITY 128
+
+// The Telegram task runs the TLS handshake, cert-bundle verification, and the
+// cJSON parse on its own stack, so it needs generous headroom.
+#define TG_TASK_STACK_SIZE 16384
+
 // UTF-8 for U+00B0; a separate "C" literal follows so the escape does not
 // swallow it as another hex digit. url_encode percent-encodes it on the wire.
 #define DEGREE_SIGN "\xC2\xB0"
@@ -95,9 +103,9 @@ static void url_encode(const char *src, char *dst, size_t dst_cap)
 
 // Fire-and-forget reply to the chat. The response is ignored; failures are
 // logged and swallowed, since a lost acknowledgement must not stall polling.
-static void tg_send_message(esp_http_client_handle_t client, int64_t chat_id, const char *text)
+static void tg_send_message(esp_http_client_handle_t client, tg_rx_t *rx, int64_t chat_id, const char *text)
 {
-    char encoded[256];
+    char encoded[3 * TG_MSG_CAPACITY + 1];
     char url[TG_URL_CAPACITY];
     url_encode(text, encoded, sizeof(encoded));
     snprintf(url, sizeof(url),
@@ -105,6 +113,12 @@ static void tg_send_message(esp_http_client_handle_t client, int64_t chat_id, co
              config_telegram_token(), (long long)chat_id, encoded);
     esp_http_client_set_url(client, url);
     esp_http_client_set_method(client, HTTP_METHOD_GET);
+    // The reply body is ignored, but the event handler accumulates into the
+    // shared rx buffer via the client's user_data. Reset it so the discarded
+    // response starts clean instead of piling onto the just-parsed getUpdates
+    // buffer and spuriously tripping the overflow guard.
+    rx->len = 0;
+    rx->overflow = false;
     esp_err_t err = esp_http_client_perform(client);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "sendMessage failed: %s", esp_err_to_name(err));
@@ -127,7 +141,7 @@ static bool is_command(const char *text, const char *cmd)
 // s_temp_sensor is left NULL and /status reports temperature as unavailable.
 static void temp_sensor_init(void)
 {
-    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 80);
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
     esp_err_t err = temperature_sensor_install(&cfg, &s_temp_sensor);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "temp sensor install failed: %s", esp_err_to_name(err));
@@ -159,10 +173,10 @@ static void format_uptime(char *buf, size_t cap)
     snprintf(buf, cap, "%dd %02dh %02dm %02ds", days, hours, mins, secs);
 }
 
-static void tg_send_status(esp_http_client_handle_t client, int64_t chat_id)
+static void tg_send_status(esp_http_client_handle_t client, tg_rx_t *rx, int64_t chat_id)
 {
     char uptime[48];
-    char msg[128];
+    char msg[TG_MSG_CAPACITY];
     float temp;
     format_uptime(uptime, sizeof(uptime));
     if (read_chip_temp(&temp)) {
@@ -171,21 +185,21 @@ static void tg_send_status(esp_http_client_handle_t client, int64_t chat_id)
     } else {
         snprintf(msg, sizeof(msg), "RevRevRev\nuptime: %s\nchip temp: n/a", uptime);
     }
-    tg_send_message(client, chat_id, msg);
+    tg_send_message(client, rx, chat_id, msg);
 }
 
-static void tg_handle_command(esp_http_client_handle_t client, int64_t chat_id, const char *text)
+static void tg_handle_command(esp_http_client_handle_t client, tg_rx_t *rx, int64_t chat_id, const char *text)
 {
     if (is_command(text, "/wake")) {
         ESP_LOGI(TAG, "Authorized wake from chat %lld", (long long)chat_id);
         // Flag the wake before the reply: the host waking must not wait on the
         // acknowledgement's round trip.
         atomic_store(&s_wake_requested, true);
-        tg_send_message(client, chat_id, "Waking the host.");
+        tg_send_message(client, rx, chat_id, "Waking the host.");
     } else if (is_command(text, "/status")) {
-        tg_send_status(client, chat_id);
+        tg_send_status(client, rx, chat_id);
     } else if (is_command(text, "/start")) {
-        tg_send_message(client, chat_id,
+        tg_send_message(client, rx, chat_id,
                         "RevRevRev online. /wake wakes the host, /status shows uptime and temperature.");
     }
     // Any other text from an authorized chat is intentionally ignored.
@@ -259,7 +273,7 @@ static void tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int
             ESP_LOGW(TAG, "Ignoring command from unauthorized chat %lld", (long long)chat_id);
             continue;
         }
-        tg_handle_command(client, chat_id, text->valuestring);
+        tg_handle_command(client, rx, chat_id, text->valuestring);
     }
 
     cJSON_Delete(root);
@@ -382,7 +396,7 @@ static void telegram_task(void *arg)
 
 void telegram_start(void)
 {
-    xTaskCreate(telegram_task, "telegram", 8192, NULL, 5, NULL);
+    xTaskCreate(telegram_task, "telegram", TG_TASK_STACK_SIZE, NULL, 5, NULL);
 }
 
 bool telegram_take_wake_request(void)

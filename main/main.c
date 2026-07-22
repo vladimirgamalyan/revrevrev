@@ -1,17 +1,18 @@
 /*
- * Firmware spike: wake over USB HID with WiFi up, now trimmed to measure the
- * device's realistic idle draw.
+ * RevRevRev main task: brings up USB HID, WiFi, and the status LED, then loops
+ * polling the BOOT button (manual wake test) and the Telegram wake flag. It owns
+ * all USB HID access; the Telegram task only sets a flag this loop drains.
  *
- * The port-stress question is settled (the port sustained ~100 mA of WiFi load
- * overnight in S3). This variant drops the artificial TX load and enables
- * WIFI_PS_MIN_MODEM — the power profile the real long-poll workload would use —
- * so a USB meter reads a number close to production idle. No TLS, no Telegram.
+ * WiFi runs with WIFI_PS_MIN_MODEM (modem sleep between DTIM beacons), the power
+ * profile the long-poll workload uses, keeping idle draw around 20 mA.
  */
 
+#include <stdatomic.h>
 #include <string.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "class/hid/hid_device.h"
@@ -103,12 +104,20 @@ void tud_resume_cb(void)
 // should turn it off entirely during host sleep, where every mA counts.
 static led_strip_handle_t status_led;
 
+// Serializes LED access: led_set runs from both the main task (init, wake blink)
+// and the event-loop task (WiFi status), and the led_strip/RMT backend is not
+// safe to drive from two tasks at once.
+static SemaphoreHandle_t s_led_mutex;
+
 // Tracks the WiFi indicator state so a wake blink can restore the right color
 // afterwards. Written from the event task, read from the main task.
-static volatile bool s_wifi_connected;
+static atomic_bool s_wifi_connected;
 
 static void led_init(void)
 {
+    s_led_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_led_mutex ? ESP_OK : ESP_ERR_NO_MEM);
+
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_GPIO,
         .max_leds = 1,
@@ -126,14 +135,16 @@ static void led_init(void)
 
 static void led_set(uint8_t r, uint8_t g, uint8_t b)
 {
+    xSemaphoreTake(s_led_mutex, portMAX_DELAY);
     led_strip_set_pixel(status_led, 0, r, g, b);
     led_strip_refresh(status_led);
+    xSemaphoreGive(s_led_mutex);
 }
 
 // Restore the LED to the current WiFi indicator color.
 static void led_restore_status(void)
 {
-    if (s_wifi_connected) {
+    if (atomic_load(&s_wifi_connected)) {
         led_set(0, 2, 0); // green: connected
     } else {
         led_set(2, 0, 0); // red: not connected
@@ -162,13 +173,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "WiFi disconnected, reconnecting");
-        s_wifi_connected = false;
+        atomic_store(&s_wifi_connected, false);
         led_set(2, 0, 0); // red: not connected
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = data;
         ESP_LOGI(TAG, "Got IP " IPSTR, IP2STR(&event->ip_info.ip));
-        s_wifi_connected = true;
+        atomic_store(&s_wifi_connected, true);
         led_set(0, 2, 0); // green: connected with an IP
     }
 }
