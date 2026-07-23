@@ -98,6 +98,9 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 static atomic_bool s_usb_mounted;
 static atomic_bool s_usb_suspended;
 static atomic_bool s_usb_remote_wakeup_en;
+// False until the host has suspended once, so /status can show "unknown" rather
+// than conflating "not negotiated yet" with "host left remote wakeup off".
+static atomic_bool s_usb_wakeup_negotiated;
 
 bool usb_is_mounted(void)
 {
@@ -109,9 +112,12 @@ bool usb_is_suspended(void)
     return atomic_load(&s_usb_suspended);
 }
 
-bool usb_remote_wakeup_enabled(void)
+usb_remote_wakeup_state_t usb_remote_wakeup_state(void)
 {
-    return atomic_load(&s_usb_remote_wakeup_en);
+    if (!atomic_load(&s_usb_wakeup_negotiated)) {
+        return USB_REMOTE_WAKEUP_UNKNOWN;
+    }
+    return atomic_load(&s_usb_remote_wakeup_en) ? USB_REMOTE_WAKEUP_ON : USB_REMOTE_WAKEUP_OFF;
 }
 
 /********* TinyUSB device callbacks ***************/
@@ -122,6 +128,7 @@ bool usb_remote_wakeup_enabled(void)
 void tud_suspend_cb(bool remote_wakeup_en)
 {
     atomic_store(&s_usb_remote_wakeup_en, remote_wakeup_en);
+    atomic_store(&s_usb_wakeup_negotiated, true);
     ESP_LOGI(TAG, "USB suspended, remote wakeup %s", remote_wakeup_en ? "enabled" : "disabled");
 }
 

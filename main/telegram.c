@@ -220,7 +220,12 @@ static void tg_send_status(esp_http_client_handle_t client, tg_rx_t *rx, int64_t
     // signal that decides whether /wake can wake a sleeping host.
     const char *link = usb_is_mounted() ? "mounted" : "not mounted";
     const char *bus = usb_is_suspended() ? "suspended" : "awake";
-    const char *rwake = usb_remote_wakeup_enabled() ? "on" : "off";
+    const char *rwake;
+    switch (usb_remote_wakeup_state()) {
+        case USB_REMOTE_WAKEUP_ON:  rwake = "on"; break;
+        case USB_REMOTE_WAKEUP_OFF: rwake = "off"; break;
+        default:                    rwake = "unknown"; break;
+    }
 
     char msg[TG_MSG_CAPACITY];
     snprintf(msg, sizeof(msg),

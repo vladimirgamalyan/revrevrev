@@ -89,8 +89,10 @@ reconnects on disconnect and reflects link state on the LED.
 - **Commands.** `/wake` triggers a wake and replies `Sending wake key to the
   host.` — the action taken, not a claim that the host woke; `/status` replies
   with uptime since boot, the chip's internal die temperature, and the USB link
-  state — `mounted`/`suspended` and whether the host enabled `remote-wake` — as a
-  wake diagnostic readable over Telegram without the UART console; `/start`
+  state — `mounted`/`suspended` and whether the host enabled `remote-wake`
+  (`unknown` until the host has slept once, since the flag is only negotiated at
+  suspend) — as a wake diagnostic readable over Telegram without the UART
+  console; `/start`
   replies with a short help line; anything else from an authorized chat is
   ignored. The wake flag is set **before** the reply is sent, so the reply's
   round trip cannot delay the wake.
