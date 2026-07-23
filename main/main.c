@@ -21,12 +21,19 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "led_strip.h"
 #include "config.h"
 #include "telegram.h"
+#include "usb_status.h"
 
 #define APP_BUTTON (GPIO_NUM_0) // BOOT button
 #define LED_GPIO (GPIO_NUM_48)  // Onboard WS2812 RGB LED
+
+// After a remote-wakeup request, watch this long for the USB bus to resume — the
+// one device-side signal that the host actually woke. Generous enough to cover a
+// slow resume from S3; if it does not resume in time, no confirmation is sent.
+#define WAKE_CONFIRM_TIMEOUT_US (12 * 1000000)
 static const char *TAG = "revrevrev";
 
 /************* TinyUSB descriptors ****************/
@@ -84,11 +91,37 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     (void) bufsize;
 }
 
+/********* USB status publication ***************/
+
+// Snapshots of the USB link the main task publishes for the /status diagnostic,
+// so the Telegram task reads state instead of touching TinyUSB from its context.
+static atomic_bool s_usb_mounted;
+static atomic_bool s_usb_suspended;
+static atomic_bool s_usb_remote_wakeup_en;
+
+bool usb_is_mounted(void)
+{
+    return atomic_load(&s_usb_mounted);
+}
+
+bool usb_is_suspended(void)
+{
+    return atomic_load(&s_usb_suspended);
+}
+
+bool usb_remote_wakeup_enabled(void)
+{
+    return atomic_load(&s_usb_remote_wakeup_en);
+}
+
 /********* TinyUSB device callbacks ***************/
 
-// Confirms whether the host actually enabled remote wakeup for this device.
+// Confirms whether the host actually enabled remote wakeup for this device, and
+// publishes it for /status — this is the signal that decides whether a /wake can
+// wake the host from sleep.
 void tud_suspend_cb(bool remote_wakeup_en)
 {
+    atomic_store(&s_usb_remote_wakeup_en, remote_wakeup_en);
     ESP_LOGI(TAG, "USB suspended, remote wakeup %s", remote_wakeup_en ? "enabled" : "disabled");
 }
 
@@ -133,22 +166,34 @@ static void led_init(void)
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &status_led));
 }
 
+// Assumes s_led_mutex is already held. Used by led_set and by callers that must
+// hold the mutex across more than one step (see led_restore_status).
+static void led_set_locked(uint8_t r, uint8_t g, uint8_t b)
+{
+    led_strip_set_pixel(status_led, 0, r, g, b);
+    led_strip_refresh(status_led);
+}
+
 static void led_set(uint8_t r, uint8_t g, uint8_t b)
 {
     xSemaphoreTake(s_led_mutex, portMAX_DELAY);
-    led_strip_set_pixel(status_led, 0, r, g, b);
-    led_strip_refresh(status_led);
+    led_set_locked(r, g, b);
     xSemaphoreGive(s_led_mutex);
 }
 
-// Restore the LED to the current WiFi indicator color.
+// Restore the LED to the current WiFi indicator color. The state read and the
+// pixel write happen under one mutex hold so a concurrent WiFi event — which
+// flips s_wifi_connected and repaints — cannot interleave between them and
+// leave the LED stuck on a stale color.
 static void led_restore_status(void)
 {
+    xSemaphoreTake(s_led_mutex, portMAX_DELAY);
     if (atomic_load(&s_wifi_connected)) {
-        led_set(0, 2, 0); // green: connected
+        led_set_locked(0, 2, 0); // green: connected
     } else {
-        led_set(2, 0, 0); // red: not connected
+        led_set_locked(2, 0, 0); // red: not connected
     }
+    xSemaphoreGive(s_led_mutex);
 }
 
 // Brief blue flashes to confirm a wake command was received. A test aid; runs
@@ -223,18 +268,25 @@ static void send_wake_keypress(void)
 
 // The one wake action, driven by either trigger: the BOOT button (manual test)
 // or an authorized Telegram command. Runs only in the main task, so all USB
-// access stays single-threaded.
-static void trigger_wake(void)
+// access stays single-threaded. Returns true when a remote wakeup was actually
+// signalled — the only case where a subsequent bus resume confirms the host woke.
+static bool trigger_wake(void)
 {
     if (tud_suspended()) {
         // The bus is asleep — an ordinary HID report would not be seen. This is
-        // the only path that can wake the host.
+        // the only path that can wake the host. tud_remote_wakeup() returns true
+        // only if the host had remote wakeup enabled and the signal was sent, so
+        // a resume that follows is attributable to this request.
         ESP_LOGI(TAG, "Bus suspended, requesting remote wakeup");
-        tud_remote_wakeup();
+        return tud_remote_wakeup();
     } else if (tud_mounted()) {
         ESP_LOGI(TAG, "Sending wake keypress");
         send_wake_keypress();
+        // Display-wake path: the host is already in S0, so there is no bus
+        // resume to observe and no confirmation is possible.
+        return false;
     }
+    return false;
 }
 
 void app_main(void)
@@ -277,7 +329,18 @@ void app_main(void)
     telegram_start();
 
     bool button_was_up = true;
+
+    // While >0, a Telegram wake requested a remote wakeup and we are watching for
+    // the bus to resume so we can confirm to wake_confirm_chat that the host woke.
+    int64_t wake_confirm_deadline = 0;
+    int64_t wake_confirm_chat = 0;
+
     while (1) {
+        // Publish the current USB link state for the /status diagnostic. Done
+        // from this task so the Telegram task never reads TinyUSB itself.
+        atomic_store(&s_usb_mounted, tud_mounted());
+        atomic_store(&s_usb_suspended, tud_suspended());
+
         bool button_is_up = gpio_get_level(APP_BUTTON);
         if (button_was_up && !button_is_up) {
             // Falling edge: BOOT button just pressed (manual wake test).
@@ -288,9 +351,27 @@ void app_main(void)
         // Wake requested by an authorized Telegram command. Draining it here
         // keeps every USB HID call in this one task. Wake first, then blink the
         // LED as a visible confirmation the command arrived.
-        if (telegram_take_wake_request()) {
-            trigger_wake();
+        int64_t wake_chat;
+        if (telegram_take_wake_request(&wake_chat)) {
+            bool may_resume = trigger_wake();
             wake_blink();
+            if (may_resume) {
+                // A remote wakeup was signalled: start watching for the resume.
+                wake_confirm_chat = wake_chat;
+                wake_confirm_deadline = esp_timer_get_time() + WAKE_CONFIRM_TIMEOUT_US;
+            }
+        }
+
+        // If a remote wakeup is outstanding, a bus that is no longer suspended is
+        // the host having woken. Confirm it once, then stop watching; give up
+        // silently if the deadline passes without a resume.
+        if (wake_confirm_deadline != 0) {
+            if (!tud_suspended()) {
+                telegram_notify_wake_confirmed(wake_confirm_chat);
+                wake_confirm_deadline = 0;
+            } else if (esp_timer_get_time() >= wake_confirm_deadline) {
+                wake_confirm_deadline = 0;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }

@@ -21,16 +21,20 @@ Three concurrent contexts run:
 - **The default event-loop task** handles WiFi/IP events and drives the status
   LED.
 
-The Telegram task never calls into USB. It hands the request off through a single
-`atomic_bool` that the main loop drains via `telegram_take_wake_request()`, so
-every HID report is issued from one task and no locking around TinyUSB is needed:
+The Telegram task never calls into USB. It hands the request off through atomic
+flags that the main loop drains via `telegram_take_wake_request()`, so every HID
+report is issued from one task and no locking around TinyUSB is needed. Once the
+main task sees the host resume it signals back through
+`telegram_notify_wake_confirmed()`, and the Telegram task sends the confirmation:
 
 ```
-Telegram task            main task
--------------            ---------
+Telegram task                        main task
+-------------                        ---------
 /wake received
-  atomic_store(flag) --> telegram_take_wake_request()  (atomic_exchange)
-                           trigger_wake()  --> USB HID
+  store(flag, chat_id) ----------->  telegram_take_wake_request()
+                                       trigger_wake()  --> USB HID
+                                       bus resumes = host woke
+  send "Host woke up."  <---------  telegram_notify_wake_confirmed()
 ```
 
 ## USB HID wake
@@ -82,11 +86,22 @@ reconnects on disconnect and reflects link state on the LED.
 - **Backlog drain.** On boot the first request uses `offset=-1`, which returns
   only the latest update; the task fast-forwards `offset` past it **without
   acting**. This keeps a stale command sent before a reboot from waking the host.
-- **Commands.** `/wake` triggers a wake and replies `Waking the host.`;
-  `/status` replies with uptime since boot and the chip's internal
-  die temperature; `/start` replies with a short help line; anything else from an
-  authorized chat is ignored. The wake flag is set **before** the reply is sent,
-  so the reply's round trip cannot delay the wake.
+- **Commands.** `/wake` triggers a wake and replies `Sending wake key to the
+  host.` — the action taken, not a claim that the host woke; `/status` replies
+  with uptime since boot, the chip's internal die temperature, and the USB link
+  state — `mounted`/`suspended` and whether the host enabled `remote-wake` — as a
+  wake diagnostic readable over Telegram without the UART console; `/start`
+  replies with a short help line; anything else from an authorized chat is
+  ignored. The wake flag is set **before** the reply is sent, so the reply's
+  round trip cannot delay the wake.
+- **Wake confirmation.** When the host was asleep (USB bus suspended) and the
+  wake was signalled via remote wakeup, the main task watches for the bus to
+  resume — the one device-side signal that the host actually woke, needing no
+  host software — and a second reply, `Host woke up.`, is sent. A display-only
+  wake (host already in S0) produces no observable resume, so no confirmation is
+  sent there. To deliver the confirmation within seconds, the poll loop briefly
+  shortens its long-poll after a `/wake`
+  ([ADR-0009](adr/0009-confirm-host-wake-on-bus-resume.md)).
 - **Liveness watchdog.** A completed `getUpdates` (HTTP 200) is the device's
   liveness signal. If contact with Telegram is lost for too long — a wall-clock
   silence window, or enough back-to-back failures — the poll loop calls
@@ -196,3 +211,4 @@ The reasoning behind these choices lives in the ADRs:
 - [ADR-0006](adr/0006-stay-on-esp32s3-wifi.md) — stay on ESP32-S3 with WiFi.
 - [ADR-0007](adr/0007-verify-telegram-tls-with-cert-bundle.md) — verify TLS with the certificate bundle.
 - [ADR-0008](adr/0008-reboot-on-lost-telegram-contact.md) — reboot on lost Telegram contact.
+- [ADR-0009](adr/0009-confirm-host-wake-on-bus-resume.md) — confirm host wake on USB bus resume.

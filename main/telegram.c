@@ -18,6 +18,7 @@
 
 #include "config.h"
 #include "watchdog.h"
+#include "usb_status.h"
 
 static const char *TAG = "telegram";
 
@@ -27,6 +28,13 @@ static const char *TAG = "telegram";
 #define TG_LONG_POLL_SECONDS 50
 #define TG_HTTP_TIMEOUT_MS ((TG_LONG_POLL_SECONDS + 10) * 1000)
 #define TG_BACKOFF_MS 5000
+
+// After an authorized /wake, poll on this short timeout for a brief window so a
+// "host woke" confirmation from the main task can be delivered within seconds
+// instead of waiting out the next full long-poll. The window bounds how long we
+// keep short-polling if the host never resumes.
+#define TG_CONFIRM_POLL_SECONDS 2
+#define TG_CONFIRM_WINDOW_SECONDS 15
 
 // A Telegram text message tops out at 4096 characters; 8 KiB leaves ample room
 // for the surrounding JSON of one update.
@@ -46,8 +54,19 @@ static const char *TAG = "telegram";
 #define DEGREE_SIGN "\xC2\xB0"
 
 // Set by the polling task on an authorized /wake, drained by the main task,
-// which owns all USB access. A flag is the only thing that crosses tasks.
+// which owns all USB access. s_wake_chat_id carries which chat asked, so the
+// main task can address the later "host woke" confirmation back to it.
 static atomic_bool s_wake_requested;
+static atomic_int_least64_t s_wake_chat_id;
+
+// Set by the main task once it observes the host actually resume after a wake
+// (USB bus resume), drained by the polling task, which replies to the chat.
+static atomic_bool s_wake_confirmed;
+static atomic_int_least64_t s_wake_confirm_chat_id;
+
+// Task-local to the polling task: raised by tg_handle_command on a /wake so the
+// loop shortens its polling and watches for the confirmation above.
+static bool s_wake_pending_confirm;
 
 // Internal die-temperature sensor, installed once at task start and read on
 // /status. NULL if installation failed; /status then reports temperature as
@@ -125,6 +144,16 @@ static void tg_send_message(esp_http_client_handle_t client, tg_rx_t *rx, int64_
     }
 }
 
+// Send a compile-time string literal, asserting it fits the reply budget so a
+// future longer literal fails the build instead of being silently truncated by
+// tg_send_message's fixed-size encode buffer.
+#define TG_SEND_LITERAL(client, rx, chat_id, lit)                \
+    do {                                                         \
+        _Static_assert(sizeof(lit) <= TG_MSG_CAPACITY,           \
+                       "reply literal exceeds TG_MSG_CAPACITY"); \
+        tg_send_message((client), (rx), (chat_id), (lit));       \
+    } while (0)
+
 // Match a bot command at the start of text, allowing the "/cmd@botname" form
 // and a trailing argument, so "/wakeup" does not match "/wake".
 static bool is_command(const char *text, const char *cmd)
@@ -175,16 +204,28 @@ static void format_uptime(char *buf, size_t cap)
 
 static void tg_send_status(esp_http_client_handle_t client, tg_rx_t *rx, int64_t chat_id)
 {
-    char uptime[48];
-    char msg[TG_MSG_CAPACITY];
-    float temp;
+    char uptime[32]; // "Dd HHh MMm SSs" — ample even for an absurd day count
     format_uptime(uptime, sizeof(uptime));
+
+    char temp_str[16];
+    float temp;
     if (read_chip_temp(&temp)) {
-        snprintf(msg, sizeof(msg),
-                 "RevRevRev\nuptime: %s\nchip temp: %.1f" DEGREE_SIGN "C", uptime, temp);
+        snprintf(temp_str, sizeof(temp_str), "%.1f" DEGREE_SIGN "C", temp);
     } else {
-        snprintf(msg, sizeof(msg), "RevRevRev\nuptime: %s\nchip temp: n/a", uptime);
+        snprintf(temp_str, sizeof(temp_str), "n/a");
     }
+
+    // USB diagnostics: whether the host sees the device, whether the bus is
+    // suspended (host asleep), and whether the host enabled remote wakeup — the
+    // signal that decides whether /wake can wake a sleeping host.
+    const char *link = usb_is_mounted() ? "mounted" : "not mounted";
+    const char *bus = usb_is_suspended() ? "suspended" : "awake";
+    const char *rwake = usb_remote_wakeup_enabled() ? "on" : "off";
+
+    char msg[TG_MSG_CAPACITY];
+    snprintf(msg, sizeof(msg),
+             "RevRevRev\nuptime: %s\nchip temp: %s\nUSB: %s, %s, remote-wake %s",
+             uptime, temp_str, link, bus, rwake);
     tg_send_message(client, rx, chat_id, msg);
 }
 
@@ -193,13 +234,19 @@ static void tg_handle_command(esp_http_client_handle_t client, tg_rx_t *rx, int6
     if (is_command(text, "/wake")) {
         ESP_LOGI(TAG, "Authorized wake from chat %lld", (long long)chat_id);
         // Flag the wake before the reply: the host waking must not wait on the
-        // acknowledgement's round trip.
+        // acknowledgement's round trip. The reply reports the action taken — a
+        // wake key was sent — not that the host woke: the main task issues the
+        // wake asynchronously and only it can observe whether the host resumed.
+        // Record the chat first so it is visible once the flag is seen, then ask
+        // the loop to watch for the main task's follow-up confirmation.
+        atomic_store(&s_wake_chat_id, chat_id);
         atomic_store(&s_wake_requested, true);
-        tg_send_message(client, rx, chat_id, "Waking the host.");
+        s_wake_pending_confirm = true;
+        TG_SEND_LITERAL(client, rx, chat_id, "Sending wake key to the host.");
     } else if (is_command(text, "/status")) {
         tg_send_status(client, rx, chat_id);
     } else if (is_command(text, "/start")) {
-        tg_send_message(client, rx, chat_id,
+        TG_SEND_LITERAL(client, rx, chat_id,
                         "RevRevRev online. /wake wakes the host, /status shows uptime and temperature.");
     }
     // Any other text from an authorized chat is intentionally ignored.
@@ -226,14 +273,16 @@ static void tg_prime_offset(tg_rx_t *rx, int64_t *offset)
 }
 
 // Parse one getUpdates response, advancing *offset past every update seen so
-// the same updates are not redelivered on the next poll.
-static void tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int64_t *offset)
+// the same updates are not redelivered on the next poll. Returns true when the
+// body was a well-formed getUpdates payload (an empty result included), false
+// when it could not be parsed or had an unexpected shape.
+static bool tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int64_t *offset)
 {
     rx->buf[rx->len] = '\0';
     cJSON *root = cJSON_Parse(rx->buf);
     if (root == NULL) {
         ESP_LOGW(TAG, "getUpdates JSON parse failed");
-        return;
+        return false;
     }
 
     cJSON *ok = cJSON_GetObjectItem(root, "ok");
@@ -241,7 +290,7 @@ static void tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int
     if (!cJSON_IsTrue(ok) || !cJSON_IsArray(result)) {
         ESP_LOGW(TAG, "Unexpected getUpdates payload");
         cJSON_Delete(root);
-        return;
+        return false;
     }
 
     cJSON *update;
@@ -267,6 +316,8 @@ static void tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int
         if (!cJSON_IsNumber(chat_id_item)) {
             continue;
         }
+        // cJSON holds every number as a double; Telegram chat IDs stay well
+        // within 2^53, so this conversion is exact for all IDs the API issues.
         int64_t chat_id = (int64_t)chat_id_item->valuedouble;
 
         if (!config_chat_allowed(chat_id)) {
@@ -277,6 +328,7 @@ static void tg_handle_response(esp_http_client_handle_t client, tg_rx_t *rx, int
     }
 
     cJSON_Delete(root);
+    return true;
 }
 
 // Liveness watchdog for the poll loop (ADR-0008). The device is unattended and
@@ -305,6 +357,17 @@ static void tg_watchdog_note_failure(tg_watchdog_t *wd)
                  (long long)(silence_us / 1000000), wd->consecutive_failures);
         esp_restart();
     }
+}
+
+// Consume a pending "host woke" confirmation from the main task, if any. Returns
+// true once per confirmation, writing the chat to reply to into *chat_id.
+static bool tg_take_wake_confirmation(int64_t *chat_id)
+{
+    if (atomic_exchange(&s_wake_confirmed, false)) {
+        *chat_id = atomic_load(&s_wake_confirm_chat_id);
+        return true;
+    }
+    return false;
 }
 
 static void telegram_task(void *arg)
@@ -344,12 +407,17 @@ static void telegram_task(void *arg)
     // Seed last-success at boot so the silence window counts from now, not from 0.
     tg_watchdog_t wd = { .last_success_us = esp_timer_get_time() };
 
+    // While >0, a /wake is awaiting the main task's resume confirmation: poll on
+    // the short timeout until it arrives or this deadline passes.
+    int64_t confirm_deadline_us = 0;
+
     ESP_LOGI(TAG, "Polling Telegram getUpdates");
     while (1) {
         if (primed) {
+            int poll_timeout = (confirm_deadline_us != 0) ? TG_CONFIRM_POLL_SECONDS : TG_LONG_POLL_SECONDS;
             snprintf(url, sizeof(url),
                      "https://api.telegram.org/bot%s/getUpdates?timeout=%d&limit=1&offset=%lld",
-                     config_telegram_token(), TG_LONG_POLL_SECONDS, (long long)offset);
+                     config_telegram_token(), poll_timeout, (long long)offset);
         } else {
             snprintf(url, sizeof(url),
                      "https://api.telegram.org/bot%s/getUpdates?timeout=0&limit=1&offset=-1",
@@ -390,7 +458,32 @@ static void telegram_task(void *arg)
             primed = true;
             continue;
         }
-        tg_handle_response(client, &rx, &offset);
+        if (!tg_handle_response(client, &rx, &offset)) {
+            // A 200 whose body we could not parse or make sense of. We cannot
+            // learn its update_id to advance past it, and getUpdates would keep
+            // returning the same pending update immediately, so back off instead
+            // of spinning — the liveness watchdog counts any 200 as contact and
+            // would not catch this loop.
+            vTaskDelay(pdMS_TO_TICKS(TG_BACKOFF_MS));
+        }
+
+        // A just-handled /wake opens a window during which we poll fast so the
+        // main task's resume confirmation reaches the user within seconds.
+        if (s_wake_pending_confirm) {
+            s_wake_pending_confirm = false;
+            confirm_deadline_us = esp_timer_get_time() + (int64_t)TG_CONFIRM_WINDOW_SECONDS * 1000000;
+        }
+        if (confirm_deadline_us != 0) {
+            int64_t confirm_chat;
+            if (tg_take_wake_confirmation(&confirm_chat)) {
+                TG_SEND_LITERAL(client, &rx, confirm_chat, "Host woke up.");
+                confirm_deadline_us = 0;
+            } else if (esp_timer_get_time() >= confirm_deadline_us) {
+                // Host did not resume in time (asleep-wake failed, or this was a
+                // display-only wake the device cannot observe): stay silent.
+                confirm_deadline_us = 0;
+            }
+        }
     }
 }
 
@@ -399,7 +492,17 @@ void telegram_start(void)
     xTaskCreate(telegram_task, "telegram", TG_TASK_STACK_SIZE, NULL, 5, NULL);
 }
 
-bool telegram_take_wake_request(void)
+bool telegram_take_wake_request(int64_t *chat_id)
 {
-    return atomic_exchange(&s_wake_requested, false);
+    if (atomic_exchange(&s_wake_requested, false)) {
+        *chat_id = atomic_load(&s_wake_chat_id);
+        return true;
+    }
+    return false;
+}
+
+void telegram_notify_wake_confirmed(int64_t chat_id)
+{
+    atomic_store(&s_wake_confirm_chat_id, chat_id);
+    atomic_store(&s_wake_confirmed, true);
 }
